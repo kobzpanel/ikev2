@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
-# Full Auto: IKEv2/IPsec + Web Panel + CA download via HTTP (Apache)
-# OS: Ubuntu/Debian
+# IKEv2/IPsec + Web Panel + Apache CA download (Ubuntu/Debian)
+# Fixed edition: correct BasicAuth compare, robust cert SAN, safe secrets edits.
 set -euo pipefail
 
-# ======== CONFIG (override with env vars) ========
-VPN_USER_DEFAULT="${VPN_USER_DEFAULT:-admin}"
-VPN_PASS_DEFAULT="${VPN_PASS_DEFAULT:-123456}"
-
+# -------- CONFIG (override via env) --------
 PANEL_USER="${PANEL_USER:-paneladmin}"
 PANEL_PASS="${PANEL_PASS:-panel123}"
 PANEL_PORT="${PANEL_PORT:-8080}"
 
+VPN_USER_DEFAULT="${VPN_USER_DEFAULT:-admin}"
+VPN_PASS_DEFAULT="${VPN_PASS_DEFAULT:-123456}"
+
 VPN_NET="${VPN_NET:-10.10.10.0/24}"
 VPN_DNS1="${VPN_DNS1:-1.1.1.1}"
 VPN_DNS2="${VPN_DNS2:-8.8.8.8}"
+
 COUNTRY="${COUNTRY:-SA}"
 ORG="${ORG:-IKEv2 VPN}"
 STATE="${STATE:-Riyadh}"
 CITY="${CITY:-Riyadh}"
+# ------------------------------------------
+
+[[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }
 
 APP_DIR="/opt/ikev2-panel"
 ENV_FILE="/etc/ikev2-panel.env"
@@ -25,56 +29,51 @@ SYSTEMD_UNIT="ikev2-panel.service"
 SECRETS_FILE="/etc/ipsec.secrets"
 IPSEC_DIR="/etc/ipsec.d"
 UFW_BEFORE_RULES="/etc/ufw/before.rules"
-# ================================================
 
-[[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }
-
-# Detect interface/IP
-PRIMARY_IF="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}')"
+PRIMARY_IF="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}' || true)"
 SERVER_IP="$(curl -s4 https://ifconfig.me || true)"
-if [[ -z "$SERVER_IP" ]]; then
+if [[ -z "$SERVER_IP" && -n "$PRIMARY_IF" ]]; then
   SERVER_IP="$(ip -4 addr show dev "$PRIMARY_IF" | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
 fi
-SERVER_ID="${SERVER_ID:-$SERVER_IP}"
+SERVER_ID="${SERVER_ID:-$SERVER_IP}"  # can be DNS or IP
 
-echo "[1/9] Packages…"
+echo "[1/10] Packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl ufw iptables python3 python3-venv python3-pip apache2
+apt-get install -y curl ufw iptables python3 python3-venv python3-pip apache2 \
+                   strongswan strongswan-pki charon-systemd \
+                   libcharon-extra-plugins libstrongswan-extra-plugins openssl
 
-# --- Install strongSwan if missing
-if ! dpkg -s strongswan >/dev/null 2>&1; then
-  echo "[2/9] strongSwan setup…"
-  apt-get install -y strongswan strongswan-pki charon-systemd \
-    libcharon-extra-plugins libstrongswan-extra-plugins
+echo "[2/10] Enable IP forwarding"
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sed -i 's/^#\?net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf || true
 
-  # Forwarding
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null || true
-  sed -i 's/^#\?net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+echo "[3/10] PKI & strongSwan base"
+mkdir -p "$IPSEC_DIR"/{private,certs,cacerts}
 
-  # PKI
-  mkdir -p "$IPSEC_DIR"/{private,certs,cacerts}
-  rm -f "$IPSEC_DIR"/private/ikev2*.key "$IPSEC_DIR"/certs/ikev2*.crt "$IPSEC_DIR"/cacerts/ikev2*.crt || true
-
+# If no CA exists, create new CA
+if [[ ! -s "$IPSEC_DIR/cacerts/ikev2-ca.crt.pem" || ! -s "$IPSEC_DIR/private/ikev2-ca.key.pem" ]]; then
   ipsec pki --gen --type rsa --size 4096 --outform pem > "$IPSEC_DIR/private/ikev2-ca.key.pem"
   ipsec pki --self --ca --lifetime 3650 \
     --in "$IPSEC_DIR/private/ikev2-ca.key.pem" --type rsa \
-    --dn "C=${COUNTRY}, O=${ORG}, CN=${ORG} CA" \
+    --dn "C=${COUNTRY}, ST=${STATE}, L=${CITY}, O=${ORG}, CN=${ORG} CA" \
     --outform pem > "$IPSEC_DIR/cacerts/ikev2-ca.crt.pem"
+fi
 
-  ipsec pki --gen --type rsa --size 4096 --outform pem > "$IPSEC_DIR/private/ikev2-server.key.pem"
-  ipsec pki --pub --in "$IPSEC_DIR/private/ikev2-server.key.pem" --type rsa \
-  | ipsec pki --issue --lifetime 1825 --cacert "$IPSEC_DIR/cacerts/ikev2-ca.crt.pem" \
-      --cakey "$IPSEC_DIR/private/ikev2-ca.key.pem" \
-      --dn "C=${COUNTRY}, O=${ORG}, CN=${SERVER_ID}" \
-      --san "${SERVER_ID}" \
-      --flag serverAuth --flag ikeIntermediate \
-      --outform pem > "$IPSEC_DIR/certs/ikev2-server.crt.pem"
+# Always (re)issue server cert for the chosen SERVER_ID
+rm -f "$IPSEC_DIR/private/ikev2-server.key.pem" "$IPSEC_DIR/certs/ikev2-server.crt.pem"
+ipsec pki --gen --type rsa --size 4096 --outform pem > "$IPSEC_DIR/private/ikev2-server.key.pem"
+ipsec pki --pub --in "$IPSEC_DIR/private/ikev2-server.key.pem" --type rsa \
+| ipsec pki --issue --lifetime 1825 --cacert "$IPSEC_DIR/cacerts/ikev2-ca.crt.pem" \
+    --cakey "$IPSEC_DIR/private/ikev2-ca.key.pem" \
+    --dn "C=${COUNTRY}, ST=${STATE}, L=${CITY}, O=${ORG}, CN=${SERVER_ID}" \
+    --san "${SERVER_ID}" \
+    --flag serverAuth --flag ikeIntermediate \
+    --outform pem > "$IPSEC_DIR/certs/ikev2-server.crt.pem"
 
-  chmod 600 "$IPSEC_DIR/private/"*.pem
+chmod 600 "$IPSEC_DIR/private/"*.pem
 
-  cat >/etc/ipsec.conf <<EOF
+cat >/etc/ipsec.conf <<EOF
 config setup
   uniqueids=never
   charondebug="ike 1, knl 1, cfg 0, chd 0, net 0, enc 0, lib 0"
@@ -98,34 +97,35 @@ conn ikev2-eap
   rightsourceip=${VPN_NET}
   rightdns=${VPN_DNS1},${VPN_DNS2}
   rightsendcert=never
+  authby=pubkey
+  eap_mschapv2=yes
   eap_identity=%identity
   ike=aes256-sha256-modp2048,aes256-sha1-modp2048!
   esp=aes256-sha256,aes256-sha1!
-  authby=pubkey
-  eap_mschapv2=yes
 EOF
 
-  if ! [[ -f "$SECRETS_FILE" ]]; then
-    cat >"$SECRETS_FILE" <<EOF
-: RSA ikev2-server.key.pem
-${VPN_USER_DEFAULT} : EAP "${VPN_PASS_DEFAULT}"
-EOF
-  else
-    grep -q ": RSA ikev2-server.key.pem" "$SECRETS_FILE" || sed -i '1i : RSA ikev2-server.key.pem' "$SECRETS_FILE"
-    grep -q "^${VPN_USER_DEFAULT}\s*:" "$SECRETS_FILE" || echo "${VPN_USER_DEFAULT} : EAP \"${VPN_PASS_DEFAULT}\"" >> "$SECRETS_FILE"
-  fi
-  chmod 600 "$SECRETS_FILE"
+# Initialize secrets file safely
+if [[ -f "$SECRETS_FILE" ]]; then
+  cp -a "$SECRETS_FILE" "${SECRETS_FILE}.bak.$(date +%s)"
+fi
+touch "$SECRETS_FILE"
+chmod 600 "$SECRETS_FILE"
+# Ensure RSA line exists
+grep -q ": RSA ikev2-server.key.pem" "$SECRETS_FILE" || sed -i '1i : RSA ikev2-server.key.pem' "$SECRETS_FILE"
+# Ensure default user exists
+grep -q "^${VPN_USER_DEFAULT}\s*:\s*EAP" "$SECRETS_FILE" || echo "${VPN_USER_DEFAULT} : EAP \"${VPN_PASS_DEFAULT}\"" >> "$SECRETS_FILE"
 
-  echo "[3/9] Firewall + NAT…"
-  ufw allow OpenSSH || true
-  ufw allow 500/udp || true
-  ufw allow 4500/udp || true
-  ufw allow 80/tcp || true
-  ufw --force enable
+echo "[4/10] Firewall + NAT"
+ufw allow OpenSSH || true
+ufw allow 500/udp || true
+ufw allow 4500/udp || true
+ufw allow 80/tcp || true
+ufw allow ${PANEL_PORT}/tcp || true
+ufw --force enable
 
-  if ! grep -q "IKEv2 NAT" "$UFW_BEFORE_RULES"; then
-    sed -i '1i # IKEv2 NAT' "$UFW_BEFORE_RULES"
-    cat >>"$UFW_BEFORE_RULES" <<EOF
+if ! grep -q "IKEv2 NAT" "$UFW_BEFORE_RULES"; then
+  sed -i '1i # IKEv2 NAT' "$UFW_BEFORE_RULES"
+  cat >>"$UFW_BEFORE_RULES" <<EOF
 
 # IKEv2 NAT
 *nat
@@ -133,34 +133,34 @@ EOF
 -A POSTROUTING -s ${VPN_NET} -o ${PRIMARY_IF} -j MASQUERADE
 COMMIT
 EOF
-  fi
-  ufw reload || true
-
-  systemctl enable strongswan-starter
-  systemctl restart strongswan-starter
-
-  cp "$IPSEC_DIR/cacerts/ikev2-ca.crt.pem" /root/IKEv2_CA.crt.pem || true
-else
-  echo "[2/9] strongSwan already installed. Skipping base VPN setup."
-  ufw allow 80/tcp || true
 fi
+ufw reload || true
 
-echo "[4/9] Web panel app…"
+systemctl enable strongswan-starter
+systemctl restart strongswan-starter
+
+# Export CA for clients and serve via Apache
+cp "$IPSEC_DIR/cacerts/ikev2-ca.crt.pem" /root/IKEv2_CA.crt.pem
+cp /root/IKEv2_CA.crt.pem /var/www/html/IKEv2_CA.crt.pem
+chmod 644 /var/www/html/IKEv2_CA.crt.pem
+systemctl enable apache2
+systemctl restart apache2
+
+echo "[5/10] Panel: venv & deps"
 mkdir -p "$APP_DIR"
 python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install --upgrade pip wheel
 "$APP_DIR/venv/bin/pip" install fastapi uvicorn jinja2 python-multipart
 
-# ---- FastAPI app
+echo "[6/10] Panel app code"
 cat >"$APP_DIR/app.py" <<'PYAPP'
-import os, re, secrets, fcntl, html
+import os, re, secrets, fcntl, html, subprocess
 from pathlib import Path
 from typing import List
 from fastapi import FastAPI, Request, Form, Depends, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.templating import Jinja2Templates
-import subprocess
 
 SECRETS_FILE = Path("/etc/ipsec.secrets")
 LOCK_FILE = Path("/var/lock/ikev2_panel.lock")
@@ -173,8 +173,9 @@ app = FastAPI(title="IKEv2 User Panel")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 def auth(credentials: HTTPBasicCredentials = Depends(security)):
-    ok = secrets.compare_digest(credentials.username, PANEL_USER) and secrets.compareDigest if False else secrets.compare_digest(credentials.password, PANEL_PASS)
-    if not ok:
+    u_ok = secrets.compare_digest(credentials.username, PANEL_USER)
+    p_ok = secrets.compare_digest(credentials.password, PANEL_PASS)
+    if not (u_ok and p_ok):
         return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="IKEv2 Panel"'})
     return True
 
@@ -183,25 +184,26 @@ def read_users() -> List[str]:
         return []
     users=[]
     with open(SECRETS_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line=line.strip()
-            if not line or line.startswith("#"): continue
-            m = re.match(r'^([^:\s]+)\s*:\s*EAP\s+"', line)
-            if m: users.append(m.group(1))
-    return users
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"): continue
+            m = re.match(r'^([^:\s]+)\s*:\s*EAP\s+"', ln)
+            if m:
+                users.append(m.group(1))
+    return sorted(set(users))
 
-def modify_users(new_lines: List[str]):
+def write_users(eap_lines: List[str]):
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(LOCK_FILE, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        existing=[]
+        existing = []
         if SECRETS_FILE.exists():
             with open(SECRETS_FILE, "r", encoding="utf-8") as f:
                 existing = f.readlines()
-        kept=[ln for ln in existing if ': RSA ' in ln]
-        kept += [l if l.endswith("\n") else l+"\n" for l in new_lines]
+        keep = [ln for ln in existing if ': RSA ' in ln]
+        keep += [l if l.endswith("\n") else l+"\n" for l in eap_lines]
         with open(SECRETS_FILE, "w", encoding="utf-8") as f:
-            f.writelines(kept)
+            f.writelines(keep)
         fcntl.flock(lock, fcntl.LOCK_UN)
     try:
         subprocess.run(["systemctl","reload","strongswan-starter"], check=False)
@@ -209,7 +211,8 @@ def modify_users(new_lines: List[str]):
         pass
 
 def sanitize_user(u: str) -> str:
-    if not re.match(r'^[A-Za-z0-9_.-]{1,64}$', u): raise ValueError("Invalid username")
+    if not re.match(r'^[A-Za-z0-9_.-]{1,64}$', u):
+        raise ValueError("Invalid username")
     return u
 
 def build_eap_line(u: str, p: str) -> str:
@@ -223,7 +226,8 @@ def home(request: Request, _=Depends(auth)):
 def add_user(username: str = Form(...), password: str = Form(...), _=Depends(auth)):
     try:
         u = sanitize_user(username.strip())
-        if len(password) < 4: raise ValueError("Password too short")
+        if len(password) < 4:
+            raise ValueError("Password too short")
         preserved=[]
         if SECRETS_FILE.exists():
             with open(SECRETS_FILE,"r",encoding="utf-8") as f:
@@ -233,7 +237,7 @@ def add_user(username: str = Form(...), password: str = Form(...), _=Depends(aut
                         if m and m.group(1)!=u:
                             preserved.append(ln.strip())
         preserved.append(build_eap_line(u, password))
-        modify_users(preserved)
+        write_users(preserved)
         return RedirectResponse(url="/", status_code=303)
     except Exception as e:
         return RedirectResponse(url=f"/?error={html.escape(str(e))}", status_code=303)
@@ -250,7 +254,7 @@ def delete_user(username: str = Form(...), _=Depends(auth)):
                         m = re.match(r'^([^:\s]+)\s*:\s*EAP\s+"(.*)"\s*$', ln.strip())
                         if m and m.group(1)!=u:
                             preserved.append(ln.strip())
-        modify_users(preserved)
+        write_users(preserved)
         return RedirectResponse(url="/", status_code=303)
     except Exception as e:
         return RedirectResponse(url=f"/?error={html.escape(str(e))}", status_code=303)
@@ -320,7 +324,7 @@ th,td{padding:10px;border-bottom:1px solid #2a335a}
 </html>
 HTML
 
-echo "[5/9] Panel service…"
+echo "[7/10] Panel service"
 cat >"$ENV_FILE" <<EOF
 PANEL_USER=${PANEL_USER}
 PANEL_PASS=${PANEL_PASS}
@@ -346,37 +350,43 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-echo "[6/9] Firewall for panel + web…"
-ufw allow ${PANEL_PORT}/tcp || true
-ufw allow 80/tcp || true
 systemctl daemon-reload
 systemctl enable "${SYSTEMD_UNIT}"
 systemctl restart "${SYSTEMD_UNIT}"
 
-echo "[7/9] Make CA downloadable via Apache…"
-cp /root/IKEv2_CA.crt.pem /var/www/html/ 2>/dev/null || true
-chmod 644 /var/www/html/IKEv2_CA.crt.pem 2>/dev/null || true
-systemctl enable apache2
-systemctl restart apache2
-
-echo "[8/9] Status…"
-sleep 1
+echo "[8/10] Verify services"
+systemctl --no-pager --full status strongswan-starter || true
 systemctl --no-pager --full status "${SYSTEMD_UNIT}" || true
 systemctl --no-pager --full status apache2 || true
 
-echo "[9/9] Done."
-echo
-echo "================= INFO ================="
-echo "Panel URL : http://${SERVER_IP}:${PANEL_PORT}"
-echo "Panel Auth: ${PANEL_USER} / ${PANEL_PASS}"
-echo "CA (HTTP) : http://${SERVER_IP}/IKEv2_CA.crt.pem"
-echo "Secrets   : ${SECRETS_FILE}"
-echo
-echo "Users now :"
-awk '/: EAP /{print $1}' ${SECRETS_FILE} || true
-echo
-echo "Change panel creds:"
-echo "  sed -i 's/^PANEL_USER=.*/PANEL_USER=newuser/' ${ENV_FILE}"
-echo "  sed -i 's/^PANEL_PASS=.*/PANEL_PASS=newpass/' ${ENV_FILE}"
-echo "  systemctl restart ${SYSTEMD_UNIT}"
-echo "========================================"
+echo "[9/10] Quick server cert check"
+echo "SubjectAltName of server cert:"
+openssl x509 -in "$IPSEC_DIR/certs/ikev2-server.crt.pem" -noout -ext subjectAltName || true
+
+echo "[10/10] Done"
+cat <<INFO
+
+===================== INFO =====================
+Panel URL     : http://${SERVER_IP}:${PANEL_PORT}
+Panel Auth    : ${PANEL_USER} / ${PANEL_PASS}
+CA download   : http://${SERVER_IP}/IKEv2_CA.crt.pem
+Secrets file  : ${SECRETS_FILE}
+Server ID     : ${SERVER_ID}  (Use this exact IP/DNS on the phone)
+Users now     : $(awk '/: EAP /{print $1}' ${SECRETS_FILE} 2>/dev/null | xargs echo)
+------------------------------------------------
+Android profile:
+  Type: IKEv2 EAP (username/password)
+  Server: ${SERVER_ID}
+  CA   : IKEv2_CA.crt.pem (install this on device)
+  User : ${VPN_USER_DEFAULT}
+  Pass : ${VPN_PASS_DEFAULT}
+------------------------------------------------
+Change panel creds later:
+  sed -i 's/^PANEL_USER=.*/PANEL_USER=newuser/' ${ENV_FILE}
+  sed -i 's/^PANEL_PASS=.*/PANEL_PASS=newpass/' ${ENV_FILE}
+  systemctl restart ${SYSTEMD_UNIT}
+
+Security note: after downloading the CA, you can remove the public copy:
+  rm -f /var/www/html/IKEv2_CA.crt.pem && systemctl restart apache2
+================================================
+INFO
